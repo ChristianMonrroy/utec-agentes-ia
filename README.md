@@ -2,7 +2,7 @@
 
 Trabajos del programa de Agentes IA de UTEC Posgrado (MEng. Boris Alzamora).
 
-**Christian Monrroy** — Gerente General, JYC Automática e Instrumentación S.A.C.
+**Christian Monrroy**
 Automatización industrial: Rockwell ControlLogix/CompactLogix, PlantPAx, AVEVA, Ignition.
 
 ## Tareas
