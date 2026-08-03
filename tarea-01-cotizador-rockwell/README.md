@@ -79,30 +79,6 @@ El modelo es configurable sin tocar el código:
 $env:MODELO_OLLAMA = "qwen2.5:7b"; python agente.py
 ```
 
-## Hallazgo: la plantilla de llama3.2 en Ollama rompe el lazo ReAct
-
-Durante las pruebas el agente ignoraba por completo los resultados de sus
-herramientas y respondía *"no tengo acceso a información en tiempo real"*. La causa
-no era el modelo sino la plantilla de chat de Ollama:
-
-```
-{{- if eq .Role "user" }}<|start_header_id|>user<|end_header_id|>
-{{- if and $.Tools $last }}      ← las tools solo se inyectan si el user es el ÚLTIMO mensaje
-```
-
-En un lazo ReAct, después de actuar el último mensaje es de rol `tool`. Desde el
-segundo turno el modelo deja de ver que tiene herramientas y recibe un mensaje
-`ipython` huérfano; sumado a la línea `Cutting Knowledge Date: December 2023` que la
-plantilla inyecta siempre, responde desde su prior de entrenamiento.
-
-Verificado de forma aislada: el mismo dato entregado como `HumanMessage` se usa
-correctamente; entregado como `ToolMessage`, se ignora.
-
-**Solución:** `_observaciones_como_usuario()`, un `pre_model_hook` que reexpresa las
-observaciones como mensajes de usuario. Solo altera lo que ve el LLM
-(`llm_input_messages`); el estado conserva los `ToolMessage` reales, que son los que
-leen el auditor y la capa determinista.
-
 ## Limitación conocida
 
 Con `llama3.2` (3B) el lazo agéntico funciona y el modelo se recupera de sus propios
