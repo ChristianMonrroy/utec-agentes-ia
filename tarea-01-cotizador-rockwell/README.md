@@ -14,12 +14,7 @@ tablero de control Rockwell dimensionada y cotizada.
 
 ---
 
-## Agente, no workflow
-
-Según [Building effective agents](https://www.anthropic.com/engineering/building-effective-agents)
-(Anthropic, 2024), un *workflow* recorre rutas de código predeterminadas mientras que
-un *agente* dirige dinámicamente su propio proceso. Este proyecto está construido
-sobre esa distinción:
+## Agente
 
 | Componente | Naturaleza |
 |---|---|
