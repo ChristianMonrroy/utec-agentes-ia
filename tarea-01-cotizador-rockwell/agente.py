@@ -6,12 +6,13 @@ Tarea del programa de Agentes IA — UTEC Posgrado (MEng. Boris Alzamora)
 Autor: Christian Monrroy — JYC Automática e Instrumentación S.A.C.
 
 Agente ReAct (NO workflow) construido con `create_react_agent` de langgraph.prebuilt
-sobre Ollama local (llama3.2).
+sobre Ollama local (qwen2.5:7b).
 
 Diseño:
   - AGÉNTICO: el LLM recibe un requerimiento de ingeniería en lenguaje natural,
     dimensiona el I/O, elige plataforma (CompactLogix vs ControlLogix), descubre
-    obsolescencias y quiebres de stock, y replantea su propia configuración.
+    obsolescencias y plazos de importación incompatibles con el cronograma, y
+    replantea su propia configuración.
     El system prompt (prompt_sistema.md) fija OBJETIVO Y RESTRICCIONES, nunca
     una secuencia de pasos.
   - DETERMINISTA A PROPÓSITO: el cálculo de IGV (18%) y el formateo de la tabla
@@ -31,6 +32,7 @@ Uso:
 from __future__ import annotations
 
 import ast
+import json
 import operator
 import os
 import re
@@ -52,17 +54,37 @@ warnings.filterwarnings("ignore", message=".*create_react_agent.*")
 from langgraph.prebuilt import create_react_agent  # noqa: E402
 
 # Modelo de Ollama. Se puede cambiar sin tocar el código:
-#   $env:MODELO_OLLAMA = "qwen2.5:7b"; python agente.py
-MODELO = os.environ.get("MODELO_OLLAMA", "llama3.2")
+#   $env:MODELO_OLLAMA = "llama3.2"; python agente.py
+# El default es qwen2.5:7b porque llama3.2 (3B) no sostiene el lazo: repite la misma
+# llamada hasta agotar el límite de pasos y nunca cierra una configuración.
+MODELO = os.environ.get("MODELO_OLLAMA", "qwen2.5:7b")
+
+# Reexpresar las observaciones como mensajes de usuario es un parche para la plantilla
+# de llama3.x en Ollama (ver _preparar_observaciones). Los modelos que manejan bien el
+# rol "tool" —Qwen2.5, entre otros— no lo necesitan, y aplicárselo solo les quitaría
+# fidelidad: perderían la correspondencia explícita entre cada llamada y su resultado.
+# Se decide por familia de modelo y se puede forzar con REEXPRESAR_OBSERVACIONES=1|0.
+REEXPRESAR_OBSERVACIONES = os.environ.get(
+    "REEXPRESAR_OBSERVACIONES", "1" if MODELO.startswith("llama3") else "0"
+).strip().lower() in ("1", "true", "si", "sí", "yes")
+
 IGV = 0.18
 MONEDA = "USD"
-MAX_CICLOS_AUDITORIA = 2  # rebotes máximos del auditor antes de entregar lo que haya
+MAX_CICLOS_AUDITORIA = 5  # rebotes máximos del auditor antes de entregar lo que haya
+
+# JYC no mantiene almacén: todo el material Rockwell se importa contra pedido. Por eso
+# la restricción comercial no es cuánto hay, sino en cuánto llega. Un producto vigente
+# cuyo plazo de importación excede el cronograma del proyecto no es cotizable, aunque
+# técnicamente sea el correcto.
+PLAZO_PROYECTO_SEMANAS = int(os.environ.get("PLAZO_PROYECTO_SEMANAS", "16"))
 
 
 # ============================================================================
 # CATÁLOGO (datos de referencia — precios y consumos de orden realista)
 # ============================================================================
 # estado: "ACTIVO" | "DESCONTINUADO"
+# lead_time_semanas: plazo de importación desde fábrica. JYC no tiene almacén, así que
+#                    este es el dato que decide si una línea es ejecutable o no.
 # slots:  posiciones de chasis que ocupa (fuentes y chasis no ocupan slot)
 # ma_5v / ma_24v: consumo de backplane, en miliamperios
 
@@ -74,8 +96,7 @@ CATALOGO: dict[str, dict] = {
         "descripcion": "Controlador CompactLogix 5380, 3 MB memoria usuario, 2x puertos EtherNet/IP embebidos, hasta 8 módulos de I/O locales Compact 5000",
         "precio": 3150.00,
         "estado": "ACTIVO",
-        "stock": 4,
-        "lead_time_semanas": 6,
+        "lead_time_semanas": 10,
         "slots": 0,
         "ma_5v": 0,
         "ma_24v": 0,
@@ -88,8 +109,7 @@ CATALOGO: dict[str, dict] = {
         "descripcion": "Controlador ControlLogix 5580, 40 MB memoria usuario, puerto EtherNet/IP 1 Gb embebido",
         "precio": 14900.00,
         "estado": "ACTIVO",
-        "stock": 2,
-        "lead_time_semanas": 10,
+        "lead_time_semanas": 12,
         "slots": 1,
         "ma_5v": 1250,
         "ma_24v": 0,
@@ -102,13 +122,12 @@ CATALOGO: dict[str, dict] = {
         "descripcion": "Módulo de entrada analógica 8 canales, 4-20 mA / +-10 VDC, no aislado",
         "precio": 1980.00,
         "estado": "ACTIVO",
-        "stock": 0,
-        "lead_time_semanas": 22,
+        "lead_time_semanas": 24,
         "slots": 1,
         "ma_5v": 150,
         "ma_24v": 250,
         "canales": 8,
-        "notas": "Sin existencias en almacén Lima. Backorder de fábrica.",
+        "notas": "Baja rotación: Rockwell lo fabrica contra pedido y el plazo de importación es largo.",
     },
     "1756-IF8I": {
         "familia": "entrada analogica",
@@ -116,13 +135,12 @@ CATALOGO: dict[str, dict] = {
         "descripcion": "Módulo de entrada analógica 8 canales aislados individualmente, 4-20 mA / +-10 VDC, HART opcional",
         "precio": 2650.00,
         "estado": "ACTIVO",
-        "stock": 6,
-        "lead_time_semanas": 4,
+        "lead_time_semanas": 8,
         "slots": 1,
         "ma_5v": 300,
         "ma_24v": 200,
         "canales": 8,
-        "notas": "Aislamiento canal a canal. Reemplazo funcional del 1756-IF8.",
+        "notas": "Aislamiento canal a canal. Reemplazo funcional del 1756-IF8, de línea y con plazo de importación corto.",
     },
     "1756-IB16": {
         "familia": "entrada digital",
@@ -130,8 +148,7 @@ CATALOGO: dict[str, dict] = {
         "descripcion": "Módulo de entrada digital 16 puntos, 10-31.2 VDC, sink",
         "precio": 590.00,
         "estado": "ACTIVO",
-        "stock": 20,
-        "lead_time_semanas": 3,
+        "lead_time_semanas": 8,
         "slots": 1,
         "ma_5v": 100,
         "ma_24v": 3,
@@ -144,8 +161,7 @@ CATALOGO: dict[str, dict] = {
         "descripcion": "Módulo de salida digital 16 puntos, 10-31.2 VDC, source, con fusible electrónico",
         "precio": 780.00,
         "estado": "ACTIVO",
-        "stock": 12,
-        "lead_time_semanas": 3,
+        "lead_time_semanas": 8,
         "slots": 1,
         "ma_5v": 250,
         "ma_24v": 2,
@@ -159,8 +175,7 @@ CATALOGO: dict[str, dict] = {
         "descripcion": "Módulo Compact 5000 de entrada analógica 8 canales, 4-20 mA / +-10 VDC",
         "precio": 1240.00,
         "estado": "ACTIVO",
-        "stock": 9,
-        "lead_time_semanas": 5,
+        "lead_time_semanas": 10,
         "slots": 1,
         "ma_5v": 0,
         "ma_24v": 0,
@@ -173,8 +188,7 @@ CATALOGO: dict[str, dict] = {
         "descripcion": "Módulo Compact 5000 de entrada digital 16 puntos, 24 VDC",
         "precio": 430.00,
         "estado": "ACTIVO",
-        "stock": 18,
-        "lead_time_semanas": 4,
+        "lead_time_semanas": 8,
         "slots": 1,
         "ma_5v": 0,
         "ma_24v": 0,
@@ -187,8 +201,7 @@ CATALOGO: dict[str, dict] = {
         "descripcion": "Módulo Compact 5000 de salida digital 16 puntos, 24 VDC, source",
         "precio": 520.00,
         "estado": "ACTIVO",
-        "stock": 15,
-        "lead_time_semanas": 4,
+        "lead_time_semanas": 8,
         "slots": 1,
         "ma_5v": 0,
         "ma_24v": 0,
@@ -202,14 +215,13 @@ CATALOGO: dict[str, dict] = {
         "descripcion": "Fuente de alimentación ControlLogix, entrada 85-265 VAC, salida 5.1 V @ 10 A / 24 V @ 2.8 A / 3.3 V @ 4 A",
         "precio": 1180.00,
         "estado": "DESCONTINUADO",
-        "stock": 3,
         "lead_time_semanas": 0,
         "slots": 0,
         "ma_5v": 0,
         "ma_24v": 0,
         "cap_5v_ma": 10000,
         "cap_24v_ma": 2800,
-        "notas": "Producto descontinuado por el fabricante. Sin soporte ni reposición. No cotizar en proyectos nuevos.",
+        "notas": "Producto descontinuado por el fabricante. Ya no se puede importar ni tiene soporte. No cotizar en proyectos nuevos.",
     },
     "1756-PA75": {
         "familia": "fuente",
@@ -217,8 +229,7 @@ CATALOGO: dict[str, dict] = {
         "descripcion": "Fuente de alimentación ControlLogix, entrada 85-265 VAC, salida 5.1 V @ 13 A / 24 V @ 2.8 A / 3.3 V @ 4 A",
         "precio": 1450.00,
         "estado": "ACTIVO",
-        "stock": 5,
-        "lead_time_semanas": 6,
+        "lead_time_semanas": 12,
         "slots": 0,
         "ma_5v": 0,
         "ma_24v": 0,
@@ -232,8 +243,7 @@ CATALOGO: dict[str, dict] = {
         "descripcion": "Fuente de alimentación ControlLogix, entrada 18-32 VDC, salida 5.1 V @ 13 A / 24 V @ 2.8 A / 3.3 V @ 4 A",
         "precio": 1520.00,
         "estado": "ACTIVO",
-        "stock": 3,
-        "lead_time_semanas": 7,
+        "lead_time_semanas": 14,
         "slots": 0,
         "ma_5v": 0,
         "ma_24v": 0,
@@ -248,8 +258,7 @@ CATALOGO: dict[str, dict] = {
         "descripcion": "Chasis ControlLogix de 7 slots",
         "precio": 690.00,
         "estado": "ACTIVO",
-        "stock": 8,
-        "lead_time_semanas": 5,
+        "lead_time_semanas": 10,
         "slots": 0,
         "ma_5v": 0,
         "ma_24v": 0,
@@ -262,8 +271,7 @@ CATALOGO: dict[str, dict] = {
         "descripcion": "Chasis ControlLogix de 10 slots",
         "precio": 890.00,
         "estado": "ACTIVO",
-        "stock": 6,
-        "lead_time_semanas": 5,
+        "lead_time_semanas": 10,
         "slots": 0,
         "ma_5v": 0,
         "ma_24v": 0,
@@ -279,7 +287,7 @@ REEMPLAZOS: dict[str, list[tuple[str, str]]] = {
         ("1756-PB75", "Alternativa solo si el tablero alimenta el chasis desde un bus de 24 VDC."),
     ],
     "1756-IF8": [
-        ("1756-IF8I", "Mismo conteo de canales 4-20 mA con aislamiento individual; disponible en stock local."),
+        ("1756-IF8I", "Mismo conteo de canales 4-20 mA con aislamiento individual; se importa en un tercio del plazo."),
     ],
 }
 
@@ -377,8 +385,8 @@ def buscar_catalogo(consulta: str) -> str:
 
     Acepta términos como 'entrada analogica', 'salida digital', 'fuente',
     'chasis', 'controlador', 'CompactLogix', 'ControlLogix', '4-20 mA' o un
-    código parcial como '1756'. Devuelve código, descripción, precio y estado
-    comercial de cada coincidencia.
+    código parcial como '1756'. Devuelve código, descripción, precio, estado
+    comercial y plazo de importación de cada coincidencia.
     """
     q = (consulta or "").strip().lower()
     if not q:
@@ -401,7 +409,12 @@ def buscar_catalogo(consulta: str) -> str:
 
     lineas = [f"{len(resultados)} coincidencia(s) para '{consulta}':"]
     for codigo, p in resultados:
-        marca = "" if p["estado"] == "ACTIVO" else "  [!] DESCONTINUADO"
+        if p["estado"] != "ACTIVO":
+            marca = "  [!] DESCONTINUADO"
+        elif p["lead_time_semanas"] > PLAZO_PROYECTO_SEMANAS:
+            marca = f"  [!] entrega {p['lead_time_semanas']} sem., FUERA DE PLAZO"
+        else:
+            marca = f"  | entrega {p['lead_time_semanas']} sem."
         lineas.append(
             f"- {codigo} | {p['plataforma']} | {p['descripcion']} | {MONEDA} {p['precio']:,.2f}{marca}"
         )
@@ -429,6 +442,11 @@ def detalle_producto(codigo: str) -> str:
         f"  Precio unitario: {MONEDA} {p['precio']:,.2f} (sin IGV)",
         f"  Estado comercial: {p['estado']}",
     ]
+    if p["estado"] == "ACTIVO":
+        l.append(
+            f"  Plazo de importación: {p['lead_time_semanas']} semanas "
+            f"(proyecto: {PLAZO_PROYECTO_SEMANAS} semanas)"
+        )
     if "canales" in p:
         l.append(f"  Canales/puntos por módulo: {p['canales']}")
     if p.get("slots"):
@@ -449,16 +467,16 @@ def detalle_producto(codigo: str) -> str:
 
 
 @tool
-def verificar_stock(codigo: str, cantidad: int) -> str:
-    """Verifica disponibilidad real y vigencia comercial de un producto para la
-    cantidad que se piensa cotizar. Informa stock en almacén, faltante, lead time
-    y si el producto está descontinuado. Ejecutar antes de dar por cerrada
-    cualquier línea de la cotización.
+def verificar_suministro(codigo: str, cantidad: int) -> str:
+    """Verifica si un producto se puede suministrar para el proyecto: vigencia
+    comercial y plazo de importación contra el cronograma. JYC no mantiene
+    almacén, todo se importa contra pedido, así que lo que decide una línea es
+    en cuántas semanas llega. Ejecutar antes de dar por cerrada cualquier línea.
     """
     p = _buscar(codigo)
     if not p:
         return (
-            f"El código '{codigo}' no existe en el catálogo, no se puede verificar stock. "
+            f"El código '{codigo}' no existe en el catálogo, no se puede verificar su suministro. "
             f"Códigos parecidos: {_sugerir(codigo)}."
         )
 
@@ -467,36 +485,39 @@ def verificar_stock(codigo: str, cantidad: int) -> str:
         cant = max(1, int(cantidad))
     except (TypeError, ValueError):
         cant = 1
-    stock = p["stock"]
 
     if p["estado"] == "DESCONTINUADO":
         return (
-            f"[BLOQUEANTE] {c} está DESCONTINUADO por el fabricante. "
-            f"Existencias residuales: {stock} un., sin reposición ni soporte. "
-            f"No es cotizable en un proyecto nuevo: hay que sustituirlo."
+            f"[BLOQUEANTE] {c} está DESCONTINUADO por el fabricante: ya no se puede importar "
+            f"ni tiene soporte. No es cotizable en un proyecto nuevo: hay que sustituirlo."
         )
-    if stock == 0:
+
+    semanas = p["lead_time_semanas"]
+    if semanas > PLAZO_PROYECTO_SEMANAS:
         return (
-            f"[BLOQUEANTE] {c}: stock 0 en almacén Lima. Requerido: {cant} un. "
-            f"Lead time de fábrica: {p['lead_time_semanas']} semanas, inaceptable para el proyecto. "
-            f"Hay que sustituirlo por una alternativa disponible."
+            f"[BLOQUEANTE] {c}: plazo de importación de {semanas} semanas, contra las "
+            f"{PLAZO_PROYECTO_SEMANAS} semanas del proyecto. Llega {semanas - PLAZO_PROYECTO_SEMANAS} "
+            f"semanas tarde: hay que sustituirlo por una alternativa de plazo menor."
         )
-    if stock < cant:
+    if semanas > PLAZO_PROYECTO_SEMANAS * 0.75:
         return (
-            f"[PARCIAL] {c}: stock {stock} un., requerido {cant} un. Faltan {cant - stock} un. "
-            f"con lead time de {p['lead_time_semanas']} semanas. Evaluar sustitución o entrega parcial."
+            f"[AJUSTADO] {c}: {cant} un. con plazo de importación de {semanas} semanas, "
+            f"dentro de las {PLAZO_PROYECTO_SEMANAS} del proyecto pero sin holgura. "
+            f"Producto {p['estado']}. Precio unitario {MONEDA} {p['precio']:,.2f}."
         )
     return (
-        f"[OK] {c}: stock {stock} un. disponible, cubre las {cant} un. requeridas. "
-        f"Producto {p['estado']}. Precio unitario {MONEDA} {p['precio']:,.2f}."
+        f"[OK] {c}: {cant} un. con plazo de importación de {semanas} semanas, dentro de las "
+        f"{PLAZO_PROYECTO_SEMANAS} del proyecto. Producto {p['estado']}. "
+        f"Precio unitario {MONEDA} {p['precio']:,.2f}."
     )
 
 
 @tool
 def buscar_reemplazo(codigo: str) -> str:
     """Devuelve los sucesores o alternativas técnicas válidas para un producto
-    descontinuado o sin stock, con su justificación, precio y disponibilidad.
-    Si no hay sucesor declarado, propone equivalentes de la misma familia.
+    descontinuado o cuyo plazo de importación no entra en el proyecto, con su
+    justificación, precio y plazo. Si no hay sucesor declarado, propone
+    equivalentes de la misma familia.
     """
     c = _norm(codigo)
     p = _buscar(c)
@@ -519,7 +540,12 @@ def buscar_reemplazo(codigo: str) -> str:
         if not a:
             continue
         delta = a["precio"] - p["precio"]
-        disp = f"stock {a['stock']} un." if a["stock"] > 0 else "SIN STOCK"
+        if a["estado"] == "DESCONTINUADO":
+            disp = "NO IMPORTABLE"
+        elif a["lead_time_semanas"] > PLAZO_PROYECTO_SEMANAS:
+            disp = f"entrega {a['lead_time_semanas']} sem. FUERA DE PLAZO"
+        else:
+            disp = f"entrega {a['lead_time_semanas']} sem."
         l.append(
             f"- {alt} | {a['descripcion']} | {MONEDA} {a['precio']:,.2f} "
             f"({'+' if delta >= 0 else ''}{delta:,.2f}) | {a['estado']} | {disp}\n"
@@ -710,7 +736,7 @@ def consultar_historico(termino: str) -> str:
 HERRAMIENTAS = [
     buscar_catalogo,
     detalle_producto,
-    verificar_stock,
+    verificar_suministro,
     buscar_reemplazo,
     dimensionar_fuente,
     verificar_slots_chasis,
@@ -754,39 +780,102 @@ def cargar_system_prompt(ruta: Path = RUTA_PROMPT) -> str:
 # ============================================================================
 
 
+def es_suministrable(codigo: str) -> bool:
+    """Una línea es ejecutable si el producto sigue vigente y su importación
+    entra en el cronograma. JYC no tiene almacén: no hay más ejes que estos dos.
+    """
+    p = CATALOGO[codigo]
+    return p["estado"] == "ACTIVO" and p["lead_time_semanas"] <= PLAZO_PROYECTO_SEMANAS
+
+
+# Familias de las que una configuración lleva exactamente una unidad: si el agente
+# declaró dos chasis distintos a lo largo de la traza, vale el último, no ambos.
+_FAMILIAS_UNICAS = ("chasis", "fuente", "controlador")
+
+
 def extraer_items_de_traza(mensajes) -> list[tuple[str, int]]:
     """Recorre la traza del agente y reconstruye la lista de materiales.
 
-    Regla determinista: cada verificación de stock es una intención de cotizar
-    una línea; la última cantidad verificada por código manda; y todo código que
-    el agente mandó a reemplazar queda excluido de la cotización.
+    Regla determinista: se cotiza lo que el agente declaró ante una herramienta,
+    porque eso es lo que quedó respaldado por una verificación. Hay dos fuentes,
+    y la última declaración de cada código manda:
+
+      - `verificar_suministro(codigo, cantidad)`, que es una intención explícita
+        de cotizar esa cantidad;
+      - las listas que pasa a `dimensionar_fuente` y `verificar_slots_chasis`,
+        que son la configuración completa sobre la que pidió la validación —
+        módulos con sus cantidades, más el chasis y la fuente elegidos.
+
+    Antes solo se leía la primera fuente, y una traza donde el agente validaba
+    la configuración entera pero alcanzaba a verificar el suministro de un solo
+    código producía una cotización de una línea.
+
+    Lo que el agente mandó a reemplazar queda fuera: pedir un sustituto es
+    retirar esa línea, y si no llegó a validar el reemplazo no hay nada que
+    cotizar en su lugar.
     """
     intenciones: dict[str, int] = {}
     reemplazados: set[str] = set()
+    ultimo_unico: dict[str, str] = {}
+
+    def declarar(codigo: str, cantidad: int) -> None:
+        c = _norm(codigo)
+        if c not in CATALOGO:
+            return
+        intenciones[c] = max(1, cantidad)
+        familia = CATALOGO[c]["familia"]
+        if familia in _FAMILIAS_UNICAS:
+            ultimo_unico[familia] = c
 
     for m in mensajes:
         for tc in getattr(m, "tool_calls", None) or []:
             nombre = tc.get("name")
             args = tc.get("args") or {}
-            if nombre == "verificar_stock":
-                codigo = _norm(str(args.get("codigo", "")))
-                if codigo in CATALOGO:
-                    try:
-                        cant = max(1, int(args.get("cantidad", 1)))
-                    except (TypeError, ValueError):
-                        cant = 1
-                    intenciones[codigo] = cant
+            if nombre == "verificar_suministro":
+                try:
+                    cant = int(args.get("cantidad", 1))
+                except (TypeError, ValueError):
+                    cant = 1
+                declarar(str(args.get("codigo", "")), cant)
             elif nombre == "buscar_reemplazo":
                 reemplazados.add(_norm(str(args.get("codigo", ""))))
+            elif nombre in ("dimensionar_fuente", "verificar_slots_chasis"):
+                for codigo, cant in _parsear_lista(str(args.get("modulos", ""))):
+                    declarar(codigo, cant)
+                for clave in ("codigo_fuente", "codigo_chasis"):
+                    if args.get(clave):
+                        declarar(str(args[clave]), 1)
+
+    # De las familias de unidad única sobrevive solo la última declarada.
+    for familia, elegido in ultimo_unico.items():
+        for c in list(intenciones):
+            if CATALOGO[c]["familia"] == familia and c != elegido:
+                del intenciones[c]
 
     return [
-        (c, n)
-        for c, n in intenciones.items()
-        if c not in reemplazados and CATALOGO[c]["estado"] == "ACTIVO" and CATALOGO[c]["stock"] > 0
+        (c, n) for c, n in intenciones.items() if c not in reemplazados and es_suministrable(c)
     ]
 
 
 _PATRON_CODIGO = re.compile(r"\b([0-9]{4}-[A-Z0-9]{2,7})\b")
+
+
+def _ultima_validacion(mensajes, herramienta: str) -> dict[str, int] | None:
+    """Lista de módulos sobre la que se hizo la última llamada a `herramienta`.
+
+    Devuelve None si nunca se llamó. Se queda con la última porque una
+    validación posterior deja sin efecto a la anterior: si el agente rehace el
+    dimensionamiento tras sustituir un módulo, manda el nuevo.
+    """
+    for m in reversed(mensajes):
+        for tc in reversed(getattr(m, "tool_calls", None) or []):
+            if tc.get("name") == herramienta:
+                lista: dict[str, int] = {}
+                for codigo, cant in _parsear_lista(str((tc.get("args") or {}).get("modulos", ""))):
+                    if codigo in CATALOGO:
+                        lista[codigo] = lista.get(codigo, 0) + cant
+                return lista
+    return None
 
 
 def auditar_propuesta(mensajes) -> str | None:
@@ -820,18 +909,35 @@ def auditar_propuesta(mensajes) -> str | None:
         )
 
     validos = {c for c in citados if c in CATALOGO}
-    no_cotizables = sorted(
-        c for c in validos if CATALOGO[c]["estado"] == "DESCONTINUADO" or CATALOGO[c]["stock"] == 0
-    )
-    if no_cotizables:
+    descontinuados = sorted(c for c in validos if CATALOGO[c]["estado"] == "DESCONTINUADO")
+    if descontinuados:
         objeciones.append(
-            f"- Propones productos no cotizables (descontinuados o sin stock): {', '.join(no_cotizables)}."
+            f"- Propones productos descontinuados, que ya no se pueden importar: {', '.join(descontinuados)}."
         )
 
-    sin_verificar = sorted(c for c in validos if c not in {x for x, _ in extraer_items_de_traza(mensajes)} and c not in no_cotizables)
-    if sin_verificar and "verificar_stock" not in herramientas_usadas:
+    fuera_de_plazo = sorted(
+        c
+        for c in validos
+        if c not in descontinuados and CATALOGO[c]["lead_time_semanas"] > PLAZO_PROYECTO_SEMANAS
+    )
+    if fuera_de_plazo:
+        detalle = ", ".join(
+            f"{c} ({CATALOGO[c]['lead_time_semanas']} sem.)" for c in fuera_de_plazo
+        )
         objeciones.append(
-            f"- No verificaste disponibilidad de ninguna línea antes de entregar: {', '.join(sin_verificar)}."
+            f"- Propones productos que no llegan a tiempo: {detalle}. "
+            f"El proyecto tiene {PLAZO_PROYECTO_SEMANAS} semanas."
+        )
+
+    no_cotizables = set(descontinuados) | set(fuera_de_plazo)
+    sin_verificar = sorted(
+        c
+        for c in validos
+        if c not in {x for x, _ in extraer_items_de_traza(mensajes)} and c not in no_cotizables
+    )
+    if sin_verificar and "verificar_suministro" not in herramientas_usadas:
+        objeciones.append(
+            f"- No verificaste el suministro de ninguna línea antes de entregar: {', '.join(sin_verificar)}."
         )
 
     plataformas = {CATALOGO[c]["plataforma"].split()[0] for c in validos}
@@ -854,6 +960,29 @@ def auditar_propuesta(mensajes) -> str | None:
     elif validos and "verificar_slots_chasis" not in herramientas_usadas:
         objeciones.append("- No verificaste que los módulos quepan en la expansión local del controlador.")
 
+    # Que la herramienta se haya usado alguna vez no basta: la restricción exige que
+    # la validación sea "sobre la lista final de módulos". Un modelo pequeño tiende a
+    # dimensionar con una lista y entregar otra, y ese desajuste pasaba silencioso
+    # porque nada comparaba ambas listas.
+    cotizados = {c: n for c, n in extraer_items_de_traza(mensajes) if CATALOGO[c]["slots"] > 0}
+    for herramienta, etiqueta in (
+        ("dimensionar_fuente", "El dimensionamiento de fuente"),
+        ("verificar_slots_chasis", "La verificación de ocupación de chasis"),
+    ):
+        validada = _ultima_validacion(mensajes, herramienta)
+        if validada is None:
+            continue
+        desajustes = [
+            f"{codigo} (cotizas {n}, validaste {validada.get(codigo) or 'ninguno'})"
+            for codigo, n in sorted(cotizados.items())
+            if validada.get(codigo) != n
+        ]
+        if desajustes:
+            objeciones.append(
+                f"- {etiqueta} no respalda lo que entregas: {'; '.join(desajustes)}."
+                f" Una validación solo vale sobre la lista final de módulos."
+            )
+
     if not validos:
         objeciones.append("- Tu respuesta no contiene una lista de materiales con códigos de catálogo.")
 
@@ -872,7 +1001,8 @@ def emitir_cotizacion(items: list[tuple[str, int]], cliente: str = "Cliente") ->
     if not items:
         return (
             "\n[COTIZACIÓN] No se registraron líneas validadas en la traza del agente.\n"
-            "La capa determinista solo cotiza productos activos y con stock que el agente verificó.\n"
+            "La capa determinista solo cotiza productos vigentes cuyo plazo de importación\n"
+            "entra en el proyecto, y que el agente haya declarado ante alguna herramienta.\n"
         )
 
     ancho = 78
@@ -885,7 +1015,7 @@ def emitir_cotizacion(items: list[tuple[str, int]], cliente: str = "Cliente") ->
         f"Cliente: {cliente}",
         f"Moneda: {MONEDA}   |   Precios sin IGV   |   Validez: 15 días",
         "-" * ancho,
-        f"{'CÓDIGO':<14}{'DESCRIPCIÓN':<38}{'CANT':>5}{'P.UNIT':>10}{'TOTAL':>11}",
+        f"{'CÓDIGO':<12}{'DESCRIPCIÓN':<34}{'CANT':>5}{'ENTREGA':>9}{'P.UNIT':>9}{'TOTAL':>9}",
         "-" * ancho,
     ]
 
@@ -895,16 +1025,25 @@ def emitir_cotizacion(items: list[tuple[str, int]], cliente: str = "Cliente") ->
         importe = p["precio"] * cant
         subtotal += importe
         desc = p["descripcion"]
-        desc = desc[:35] + "..." if len(desc) > 38 else desc
-        l.append(f"{codigo:<14}{desc:<38}{cant:>5}{p['precio']:>10,.2f}{importe:>11,.2f}")
+        desc = desc[:31] + "..." if len(desc) > 34 else desc
+        entrega = f"{p['lead_time_semanas']} sem"
+        l.append(
+            f"{codigo:<12}{desc:<34}{cant:>5}{entrega:>9}{p['precio']:>9,.0f}{importe:>9,.0f}"
+        )
 
     igv = round(subtotal * IGV, 2)
     total = round(subtotal + igv, 2)
+    # Todo se importa, así que el material más lento marca la entrega del tablero.
+    plazo = max(CATALOGO[c]["lead_time_semanas"] for c, _ in items)
+    critico = sorted(c for c, _ in items if CATALOGO[c]["lead_time_semanas"] == plazo)
     l += [
         "-" * ancho,
         f"{'SUBTOTAL':>62}{subtotal:>16,.2f}",
         f"{'IGV (18%)':>62}{igv:>16,.2f}",
         f"{'TOTAL':>62}{total:>16,.2f}",
+        "-" * ancho,
+        f"Entrega estimada: {plazo} semanas puesto en almacén JYC, determinada por",
+        f"  {', '.join(critico)}. Todo el material es de importación.",
         "=" * ancho,
         "Nota: subtotal, IGV y formato de esta tabla los genera código determinista,",
         "      no el modelo. La ingeniería de la configuración sí es agéntica.",
@@ -995,7 +1134,8 @@ REQUERIMIENTO_DEMO = (
     "Necesito cotizar el tablero de control de una planta de bombeo: 14 motores de 15 HP "
     "con arranque y falla cableados a PLC, 20 señales analógicas de 4-20 mA entre presión, "
     "nivel y caudal, y comunicación EtherNet/IP con el SCADA. El cliente es minero y exige "
-    "reserva para crecer. ¿Qué configuración Rockwell me propones?"
+    "reserva para crecer. La puesta en marcha es en 16 semanas y todo el material se importa. "
+    "¿Qué configuración Rockwell me propones?"
 )
 
 
@@ -1014,30 +1154,76 @@ def _una_accion_por_turno(state: dict) -> dict:
     return {"messages": [ultimo.model_copy(update={"tool_calls": llamadas[:1]})]}
 
 
-def _observaciones_como_usuario(state: dict) -> dict:
-    """Reexpone las observaciones de las herramientas como mensajes de usuario.
+def _firma(tc: dict) -> str:
+    """Identidad de una llamada: herramienta + argumentos normalizados."""
+    return f"{tc.get('name')}|{json.dumps(tc.get('args') or {}, sort_keys=True, default=str)}"
 
-    Motivo, verificado sobre la plantilla de llama3.2 en Ollama: las definiciones
-    de las herramientas solo se inyectan en el prompt cuando el ÚLTIMO mensaje es
-    de rol "user" ({{- if and $.Tools $last }}). En un lazo ReAct, después de
-    actuar el último mensaje es de rol "tool", así que a partir del segundo turno
-    el modelo pierde de vista que tiene herramientas y trata la observación como
-    texto huérfano: responde "no tengo acceso a información en tiempo real".
 
-    Entregar la observación como mensaje de usuario corrige las dos cosas a la
-    vez: el dato entra por un canal que el modelo sí atiende, y las herramientas
-    vuelven a inyectarse para el turno siguiente.
+def _firma_de_observacion(mensajes, i: int) -> str:
+    """Firma de la llamada que originó la observación en la posición i."""
+    id_llamada = getattr(mensajes[i], "tool_call_id", None)
+    for m in reversed(mensajes[:i]):
+        for tc in getattr(m, "tool_calls", None) or []:
+            if tc.get("id") == id_llamada:
+                return _firma(tc)
+    return ""
+
+
+def _nota_de_repeticion(veces: int) -> str:
+    """Aviso de estancamiento para una consulta ya ejecutada `veces` veces.
+
+    Sin esta señal el agente no tiene forma de notar que está estancado: vuelve a
+    pedir lo mismo, recibe la misma observación y se queda en un punto fijo hasta
+    agotar el límite de pasos. La marca informa del estancamiento; qué hacer al
+    respecto lo sigue decidiendo él.
+    """
+    if veces < 2:
+        return ""
+    return (
+        f"\n\n[NOTA DEL SISTEMA] Es la {veces}ª vez que ejecutas esta consulta"
+        f" con los mismos argumentos y el resultado no cambia."
+        f" Repetirla no aporta información nueva."
+    )
+
+
+def _preparar_observaciones(state: dict) -> dict:
+    """Adapta la traza antes de cada llamada al LLM. Dos cosas, una condicional.
+
+    Siempre: marca las consultas repetidas (ver _nota_de_repeticion).
+
+    Si REEXPRESAR_OBSERVACIONES, además reexpone las observaciones como mensajes
+    de usuario. Motivo, verificado sobre la plantilla de llama3.2 en Ollama: las
+    definiciones de las herramientas solo se inyectan en el prompt cuando el
+    ÚLTIMO mensaje es de rol "user" ({{- if and $.Tools $last }}). En un lazo
+    ReAct, después de actuar el último mensaje es de rol "tool", así que a partir
+    del segundo turno el modelo pierde de vista que tiene herramientas y trata la
+    observación como texto huérfano: responde "no tengo acceso a información en
+    tiempo real". Entregar la observación como mensaje de usuario corrige las dos
+    cosas a la vez: el dato entra por un canal que el modelo sí atiende, y las
+    herramientas vuelven a inyectarse para el turno siguiente.
 
     Solo cambia lo que ve el LLM (llm_input_messages). El estado conserva los
     ToolMessage reales, que son los que leen el auditor y la capa determinista.
     """
+    mensajes = state["messages"]
+    vistas: dict[str, int] = {}
+
     entrada = []
-    for m in state["messages"]:
+    for i, m in enumerate(mensajes):
         if isinstance(m, ToolMessage):
-            entrada.append(HumanMessage(content=f"Resultado de {m.name}:\n{m.content}"))
-        elif isinstance(m, AIMessage) and m.tool_calls:
-            # La acción se narra en texto: si se dejara como tool_calls sin su
-            # ToolMessage correspondiente, LangGraph rechazaría el historial.
+            firma = _firma_de_observacion(mensajes, i)
+            vistas[firma] = veces = vistas.get(firma, 0) + 1
+            nota = _nota_de_repeticion(veces)
+            if REEXPRESAR_OBSERVACIONES:
+                entrada.append(HumanMessage(content=f"Resultado de {m.name}:\n{m.content}{nota}"))
+            elif nota:
+                entrada.append(m.model_copy(update={"content": f"{m.content}{nota}"}))
+            else:
+                entrada.append(m)
+        elif isinstance(m, AIMessage) and m.tool_calls and REEXPRESAR_OBSERVACIONES:
+            # Si se quitan los ToolMessage, la acción tiene que narrarse en texto:
+            # unas tool_calls sin su ToolMessage correspondiente harían que
+            # LangGraph rechazara el historial.
             acciones = "; ".join(f"{tc['name']}({tc.get('args')})" for tc in m.tool_calls)
             entrada.append(AIMessage(content=f"Consulto: {acciones}"))
         else:
@@ -1054,7 +1240,7 @@ def construir_agente():
         llm,
         HERRAMIENTAS,
         prompt=cargar_system_prompt(),
-        pre_model_hook=_observaciones_como_usuario,
+        pre_model_hook=_preparar_observaciones,
         post_model_hook=_una_accion_por_turno,
     )
 

@@ -14,19 +14,14 @@ tablero de control Rockwell dimensionada y cotizada.
 
 ---
 
-## Agente, no workflow
-
-Según [Building effective agents](https://www.anthropic.com/engineering/building-effective-agents)
-(Anthropic, 2024), un *workflow* recorre rutas de código predeterminadas mientras que
-un *agente* dirige dinámicamente su propio proceso. Este proyecto está construido
-sobre esa distinción:
+## Agente
 
 | Componente | Naturaleza |
 |---|---|
 | Selección de plataforma (CompactLogix vs ControlLogix) | Agéntico |
 | Dimensionamiento del I/O y conteo de módulos | Agéntico |
-| Detección de obsolescencia y quiebre de stock, y su corrección | Agéntico |
-| Cálculo de IGV (18%) y formateo de la tabla | **Determinista a propósito** |
+| Detección de obsolescencia y de plazos fuera de cronograma, y su corrección | Agéntico |
+| Cálculo de IGV (18%), plazo de entrega y formateo de la tabla | **Determinista a propósito** |
 
 El system prompt ([`prompt_sistema.md`](prompt_sistema.md)) define **objetivo y
 restricciones**, nunca una secuencia de pasos. Ninguna restricción indica qué
@@ -38,21 +33,35 @@ herramienta usar ni en qué orden: eso lo decide el modelo.
 |---|---|
 | `buscar_catalogo` | Busca productos por texto libre |
 | `detalle_producto` | Ficha técnica: canales, consumo, slots, capacidad |
-| `verificar_stock` | Disponibilidad y vigencia comercial |
-| `buscar_reemplazo` | Sucesores para descontinuados o sin stock |
+| `verificar_suministro` | Vigencia comercial y plazo de importación contra el cronograma |
+| `buscar_reemplazo` | Sucesores para descontinuados o fuera de plazo |
 | `dimensionar_fuente` | Consumo de backplane contra capacidad de la fuente |
 | `verificar_slots_chasis` | Ocupación de chasis 1756 o expansión local 5069 |
 | `calcular` | Aritmética (evaluador AST, sin `eval`) |
 | `consultar_historico` | Proyectos previos como referencia de alcance y precio |
 
+## Restricción comercial: JYC importa, no almacena
+
+JYC no mantiene stock; todo el material Rockwell se importa contra pedido. La pregunta
+que decide una línea no es cuánto hay, sino **en cuántas semanas llega** y si eso entra
+en el cronograma. Por eso el catálogo no tiene existencias: tiene plazo de importación,
+y `PLAZO_PROYECTO_SEMANAS` (16 por defecto) es el umbral contra el que se compara.
+
+La cotización final informa la entrega estimada del tablero, determinada por el material
+más lento del conjunto.
+
 ## Lazos de corrección
 
 El catálogo incluye trampas deliberadas que obligan al agente a replantear:
 
-- **`1756-PA72`** está descontinuada → debe encontrar la sucesora `1756-PA75`.
-- **`1756-IF8`** tiene stock 0 con lead time de 22 semanas → debe sustituirlo por
-  `1756-IF8I`, que cuesta más y consume distinto, invalidando el dimensionamiento
-  de fuente y la ocupación de chasis que ya hubiera calculado.
+- **`1756-PA72`** está descontinuada → ya no se puede importar, debe encontrar la
+  sucesora `1756-PA75`.
+- **`1756-IF8`** es de baja rotación y se importa en 24 semanas, contra las 16 del
+  proyecto → debe sustituirlo por el `1756-IF8I`, que llega en 8 pero cuesta USD 670
+  más por módulo y consume distinto, invalidando el dimensionamiento de fuente y la
+  ocupación de chasis que ya hubiera calculado.
+
+La segunda trampa es la decisión real de un integrador que importa: plazo contra precio.
 
 Además, `auditar_propuesta()` implementa el patrón **evaluator-optimizer**: revisa la
 propuesta final contra las restricciones y devuelve el control al agente enumerando
@@ -65,7 +74,7 @@ python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 
-ollama pull llama3.2
+ollama pull qwen2.5:7b
 python agente.py
 python agente.py "12 motores 10HP, 8 señales 4-20mA, EtherNet/IP"
 ```
@@ -73,35 +82,19 @@ python agente.py "12 motores 10HP, 8 señales 4-20mA, EtherNet/IP"
 Cada corrida se guarda en [`cotizaciones/`](cotizaciones/) como un markdown con el
 requerimiento, la traza ReAct completa, la auditoría y la tabla con IGV.
 
-El modelo es configurable sin tocar el código:
+El modelo por defecto es `qwen2.5:7b` y es configurable sin tocar el código:
 
 ```powershell
-$env:MODELO_OLLAMA = "qwen2.5:7b"; python agente.py
+$env:MODELO_OLLAMA = "llama3.2"; python agente.py
 ```
 
-## Hallazgo: la plantilla de llama3.2 en Ollama rompe el lazo ReAct
-
-Durante las pruebas el agente ignoraba por completo los resultados de sus
-herramientas y respondía *"no tengo acceso a información en tiempo real"*. La causa
-no era el modelo sino la plantilla de chat de Ollama:
-
-```
-{{- if eq .Role "user" }}<|start_header_id|>user<|end_header_id|>
-{{- if and $.Tools $last }}      ← las tools solo se inyectan si el user es el ÚLTIMO mensaje
-```
-
-En un lazo ReAct, después de actuar el último mensaje es de rol `tool`. Desde el
-segundo turno el modelo deja de ver que tiene herramientas y recibe un mensaje
-`ipython` huérfano; sumado a la línea `Cutting Knowledge Date: December 2023` que la
-plantilla inyecta siempre, responde desde su prior de entrenamiento.
-
-Verificado de forma aislada: el mismo dato entregado como `HumanMessage` se usa
-correctamente; entregado como `ToolMessage`, se ignora.
-
-**Solución:** `_observaciones_como_usuario()`, un `pre_model_hook` que reexpresa las
-observaciones como mensajes de usuario. Solo altera lo que ve el LLM
-(`llm_input_messages`); el estado conserva los `ToolMessage` reales, que son los que
-leen el auditor y la capa determinista.
+La plantilla de chat de llama3.x en Ollama solo inyecta las definiciones de las
+herramientas cuando el último mensaje es de rol `user`; en un lazo ReAct el último es
+`tool`, así que a partir del segundo turno el modelo deja de ver que tiene
+herramientas. El `pre_model_hook` lo compensa reexpresando las observaciones como
+mensajes de usuario. Como esa conversión pierde la correspondencia explícita entre
+cada llamada y su resultado, solo se aplica a la familia `llama3`; se puede forzar en
+cualquier sentido con `$env:REEXPRESAR_OBSERVACIONES = "1"` (o `"0"`).
 
 ## Limitación conocida
 
